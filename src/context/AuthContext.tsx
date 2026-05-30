@@ -1,6 +1,11 @@
 import { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react';
-import { Session, User, AuthChangeEvent } from '@supabase/supabase-js';
+import { Session, User, AuthChangeEvent, AuthError } from '@supabase/supabase-js';
 import { supabase, Profile } from '../lib/supabase';
+
+type AuthErrorType = {
+  message: string;
+  type: 'login' | 'signup' | 'general';
+};
 
 type AuthContextType = {
   session: Session | null;
@@ -8,9 +13,13 @@ type AuthContextType = {
   profile: Profile | null;
   loading: boolean;
   initializing: boolean;
-  signInWithGoogle: () => Promise<void>;
+  error: AuthErrorType | null;
+  signInWithEmail: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
+  signUpWithEmail: (email: string, password: string, fullName?: string) => Promise<{ success: boolean; error?: string }>;
+  signInWithGoogle: () => Promise<{ success: boolean; error?: string }>;
   signOut: () => Promise<void>;
   refreshProfile: () => Promise<void>;
+  clearError: () => void;
 };
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -21,16 +30,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [initializing, setInitializing] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<AuthErrorType | null>(null);
+
+  const clearError = useCallback(() => setError(null), []);
 
   const loadProfile = useCallback(async (userId: string) => {
-    const { data, error } = await supabase
+    const { data, error: profileError } = await supabase
       .from('profiles')
       .select('*')
       .eq('id', userId)
       .maybeSingle();
 
-    if (!error && data) {
+    if (!profileError && data) {
       setProfile(data);
+    } else if (profileError) {
+      console.error('Error loading profile:', profileError.message);
     }
   }, []);
 
@@ -43,11 +57,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     if (!existing) {
       const metadata = u.user_metadata ?? {};
-      await supabase.from('profiles').insert({
+      const { error: insertError } = await supabase.from('profiles').insert({
         id: u.id,
         full_name: metadata.full_name ?? metadata.name ?? '',
         avatar_url: metadata.avatar_url ?? metadata.picture ?? '',
       });
+      if (insertError) {
+        console.error('Error creating profile:', insertError.message);
+      }
     }
 
     await loadProfile(u.id);
@@ -58,10 +75,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     async function initializeAuth() {
       try {
-        const { data: { session: initialSession }, error } = await supabase.auth.getSession();
+        const { data: { session: initialSession }, error: sessionError } = await supabase.auth.getSession();
 
-        if (error) {
-          console.error('Error getting session:', error.message);
+        if (sessionError) {
+          console.error('Error getting session:', sessionError.message);
           if (mounted) setInitializing(false);
           return;
         }
@@ -87,20 +104,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       async (event: AuthChangeEvent, newSession: Session | null) => {
         if (!mounted) return;
 
+        // Update session state
         setSession(newSession);
         setUser(newSession?.user ?? null);
 
-        if (event === 'SIGNED_IN' && newSession?.user) {
+        // Handle specific auth events
+        if ((event === 'SIGNED_IN' || event === 'INITIAL_SESSION') && newSession?.user) {
           setLoading(true);
           try {
             await ensureProfile(newSession.user);
           } finally {
-            setLoading(false);
+            if (mounted) setLoading(false);
           }
         } else if (event === 'SIGNED_OUT') {
           setProfile(null);
+          setError(null);
         } else if (event === 'TOKEN_REFRESHED' && newSession) {
-          // Session refreshed, keep state
+          // Session refreshed, state already updated
           setSession(newSession);
         }
       }
@@ -112,23 +132,140 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [ensureProfile]);
 
+  const getErrorMessage = (err: AuthError): string => {
+    const message = err.message?.toLowerCase() || '';
+    if (message.includes('invalid login credentials') || message.includes('invalid email or password')) {
+      return 'Invalid email or password. Please try again.';
+    }
+    if (message.includes('user not found') || message.includes('no user found')) {
+      return 'No account found with this email. Please sign up first.';
+    }
+    if (message.includes('email not confirmed')) {
+      return 'Please check your email to confirm your account.';
+    }
+    if (message.includes('already registered') || message.includes('already exists')) {
+      return 'An account with this email already exists. Please login instead.';
+    }
+    if (message.includes('password') && message.includes('weak')) {
+      return 'Password is too weak. Please use at least 6 characters.';
+    }
+    if (message.includes('invalid email')) {
+      return 'Please enter a valid email address.';
+    }
+    return err.message || 'An unexpected error occurred. Please try again.';
+  };
+
+  async function signInWithEmail(email: string, password: string) {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const { data, error: authError } = await supabase.auth.signInWithPassword({
+        email: email.trim().toLowerCase(),
+        password,
+      });
+
+      if (authError) {
+        const message = getErrorMessage(authError);
+        setError({ message, type: 'login' });
+        return { success: false, error: message };
+      }
+
+      if (data.session && data.user) {
+        setSession(data.session);
+        setUser(data.user);
+        await ensureProfile(data.user);
+        return { success: true };
+      }
+
+      return { success: false, error: 'Login failed. Please try again.' };
+    } catch (err) {
+      const message = 'An unexpected error occurred during login.';
+      setError({ message, type: 'login' });
+      return { success: false, error: message };
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function signUpWithEmail(email: string, password: string, fullName?: string) {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const { data, error: authError } = await supabase.auth.signUp({
+        email: email.trim().toLowerCase(),
+        password,
+        options: {
+          data: {
+            full_name: fullName || '',
+          },
+        },
+      });
+
+      if (authError) {
+        const message = getErrorMessage(authError);
+        setError({ message, type: 'signup' });
+        return { success: false, error: message };
+      }
+
+      // Check if user needs email confirmation
+      if (data.user && !data.session) {
+        return {
+          success: true,
+          error: 'Account created! Please check your email to confirm your account.',
+        };
+      }
+
+      // Auto-confirmed (when email confirmation is disabled)
+      if (data.session && data.user) {
+        setSession(data.session);
+        setUser(data.user);
+        await ensureProfile(data.user);
+        return { success: true };
+      }
+
+      return { success: true };
+    } catch (err) {
+      const message = 'An unexpected error occurred during signup.';
+      setError({ message, type: 'signup' });
+      return { success: false, error: message };
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function signInWithGoogle() {
     setLoading(true);
-    const redirectUrl = `${window.location.origin}${window.location.pathname}`;
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: 'google',
-      options: {
-        redirectTo: redirectUrl,
-        queryParams: {
-          access_type: 'offline',
-          prompt: 'consent',
-        },
-      },
-    });
+    setError(null);
 
-    if (error) {
+    try {
+      const redirectUrl = `${window.location.origin}${window.location.pathname}`;
+      const { error: authError } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: redirectUrl,
+          queryParams: {
+            access_type: 'offline',
+            prompt: 'consent',
+          },
+        },
+      });
+
+      if (authError) {
+        const message = getErrorMessage(authError);
+        setError({ message, type: 'general' });
+        setLoading(false);
+        return { success: false, error: message };
+      }
+
+      // User will be redirected to Google, loading stays true
+      return { success: true };
+    } catch (err) {
+      const message = 'Google login not available. Please use email login.';
+      setError({ message, type: 'general' });
       setLoading(false);
-      throw error;
+      return { success: false, error: message };
     }
   }
 
@@ -139,6 +276,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(null);
       setUser(null);
       setProfile(null);
+      setError(null);
+    } catch (err) {
+      console.error('Sign out error:', err);
     } finally {
       setLoading(false);
     }
@@ -156,9 +296,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         profile,
         loading: initializing || loading,
         initializing,
+        error,
+        signInWithEmail,
+        signUpWithEmail,
         signInWithGoogle,
         signOut,
         refreshProfile,
+        clearError,
       }}
     >
       {children}
